@@ -751,12 +751,44 @@ impl fuser::Filesystem for TagsFs {
         flags: i32,
         reply: fuser::ReplyCreate,
     ) {
-        debug!(
-            "[Not Implemented] create(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, \
-            flags: {:#x?})",
-            parent, name, mode, umask, flags
+        trace!(
+            "create(parent: {parent:#x?}, name: {name:?}, mode: {mode:o}, \
+            umask: {umask:#x?}, flags: {flags:#x?})",
         );
-        reply.error(ENOSYS);
+        let source_path = self.source.as_ref().unwrap().join(name);
+        if source_path.is_file() {
+            reply.error(libc::EEXIST);
+            return;
+        }
+
+        let c_path = unsafe { CString::from_vec_unchecked(source_path.as_os_str().as_bytes().to_vec()) };
+        let new_fd = unsafe { libc::creat(c_path.as_ptr(), mode & !umask) };
+        if new_fd == 0 {
+            reply.error(EPERM);
+            return;
+        }
+
+        let err = unsafe { libc::close(new_fd) };
+        if err != 0 {
+            reply.error(err);
+            return;
+        }
+        let ino = Entry::File(source_path.clone()).inode_or_create(&self.conn);
+        let attr = file_attr_of_file(ino, &source_path);
+        trace!("{ino} {attr:?}");
+        let tags = match Entry::fetch(&self.conn, parent) {
+            Ok(Entry::Tags(tags)) => tags,
+            _ => BTreeSet::new(),
+        };
+        trace!("{tags:?}");
+        let mut stmt = self.conn.prepare_cached("INSERT INTO tags (file, tag) VALUES (?, ?)").unwrap();
+        for tag in tags {
+            trace!("add tag {tag:?} to {name:?}");
+            stmt.insert(params![name.to_string_lossy(), tag]).unwrap();
+        }
+
+
+        reply.created(&Duration::from_secs(0), &attr, 0, 0, 0);
     }
 
     fn getlk(
