@@ -36,7 +36,7 @@ struct TagsFs {
 
 #[derive(Eq, PartialEq, Hash, Clone)]
 enum Entry {
-    File(PathBuf),
+    File(OsString),
     Tags(BTreeSet<String>),
 }
 
@@ -111,9 +111,14 @@ impl Entry {
 
     fn discrimimant_data(&self) -> (&str, Cow<str>) {
         match self {
-            Entry::File(path) => ("file", path.to_string_lossy()),
+            Entry::File(name) => ("file", name.to_string_lossy()),
             Entry::Tags(tags) => ("tags", Cow::Owned(tags.iter().sorted().join("/"))),
         }
+    }
+}
+impl From<&Path> for Entry {
+    fn from(p: &Path) -> Self {
+        Entry::File(p.file_name().unwrap().to_os_string())
     }
 }
 
@@ -127,10 +132,28 @@ impl TagsFs {
         })
     }
 
-    fn tags(&self, filename: impl ToSql) -> BTreeSet<String> {
+    fn sub_tags(&self, tags: &BTreeSet<String>) -> Vec<String> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT DISTINCT tag FROM tags WHERE file = ?")
+            .prepare_cached(
+                format!(
+                    "SELECT tag FROM tags WHERE tag NOT IN ({})",
+                    vec!["?"; tags.len()].join(", "),
+                )
+                .as_str(),
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params_from_iter(tags.iter()), |row| {
+            row.get("tag")
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+    fn file_tags(&self, filename: impl ToSql) -> BTreeSet<String> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT DISTINCT tag FROM file_tags JOIN tags ON file_tags.tag_id = tags.id WHERE file = ?")
             .unwrap();
         stmt.query_map([filename], |row| row.get("tag"))
             .unwrap()
@@ -165,6 +188,10 @@ impl TagsFs {
             .ok()
             .map(PathBuf::from)
     }
+
+    fn find_file(&self, name: OsString) -> PathBuf {
+        self.source().unwrap().join(name).canonicalize().unwrap()
+    }
 }
 
 impl fuser::Filesystem for TagsFs {
@@ -192,8 +219,8 @@ impl fuser::Filesystem for TagsFs {
         };
         // is it a file?
         if let Ok(path) = self.source().unwrap().join(name).canonicalize() {
-            if let Ok(ino) = Entry::File(path.clone()).inode(&self.conn) {
-                let file_tags = self.tags(name.to_string_lossy());
+            if let Ok(ino) = Entry::from(path.as_ref()).inode(&self.conn) {
+                let file_tags = self.file_tags(name.to_string_lossy());
                 if tags.is_subset(&file_tags) {
                     reply.entry(&Duration::from_secs(0), &file_attr_of_file(ino, path), 0);
                 } else {
@@ -203,23 +230,7 @@ impl fuser::Filesystem for TagsFs {
             }
         }
         // is it a tag?
-        let mut stmt = self
-            .conn
-            .prepare_cached(
-                format!(
-                    "SELECT DISTINCT * FROM tags WHERE tag NOT IN ({})",
-                    vec!["?"; tags.len()].join(", "),
-                )
-                .as_str(),
-            )
-            .unwrap();
-        for row in stmt
-            .query_map(rusqlite::params_from_iter(tags.iter()), |row| {
-                row.get("tag")
-            })
-            .unwrap()
-        {
-            let row: String = row.unwrap();
+        for row in self.sub_tags(&tags) {
             if row == name.to_string_lossy() {
                 let mut tags = tags.clone();
                 tags.insert(row);
@@ -239,7 +250,8 @@ impl fuser::Filesystem for TagsFs {
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyAttr) {
         trace!("getattr(_req, {ino}, reply)");
         match Entry::fetch(&self.conn, ino) {
-            Ok(Entry::File(path)) => {
+            Ok(Entry::File(name)) => {
+                let path = self.find_file(name);
                 reply.attr(&Duration::from_secs(0), &file_attr_of_file(ino, path));
             }
             Ok(Entry::Tags(_)) => {
@@ -273,21 +285,12 @@ impl fuser::Filesystem for TagsFs {
         trace!("setattr");
         // currently only allow setting attributes of files since all tags show the attributes of
         // the source directory
-        let path = if let Ok(Entry::File(path)) = Entry::fetch(&self.conn, ino) {
-            path
+        let path = if let Ok(Entry::File(name)) = Entry::fetch(&self.conn, ino) {
+            self.find_file(name)
         } else {
             reply.error(EINVAL);
             trace!("setattr - EINVAL");
             return;
-        };
-        let path = if path.is_absolute() {
-            path
-        } else {
-            self.source()
-                .unwrap()
-                .join(path.file_name().unwrap())
-                .canonicalize()
-                .unwrap()
         };
         eprintln!("{path:?}");
         let c_path = unsafe {
@@ -401,12 +404,27 @@ impl fuser::Filesystem for TagsFs {
         reply.error(ENOSYS);
     }
 
+    /// Delete all tags of `parent` from the file `name`
+    /// Note: since we don't differentiate the order of tags there is no "last" tag we could remove
+    /// here
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        debug!(
-            "[Not Implemented] unlink(parent: {:#x?}, name: {:?})",
-            parent, name,
-        );
-        reply.error(ENOSYS);
+        trace!("unlink(parent: {:#x?}, name: {:?})", parent, name,);
+        let tags = match Entry::fetch(&self.conn, parent) {
+            Ok(Entry::Tags(tags)) => tags,
+            _ => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        let mut stmt = self
+            .conn
+            .prepare_cached("DELETE FROM file_tags WHERE tag_id = ? AND file = ?")
+            .unwrap();
+        for tag in tags {
+            let tag_id: u64 = self.conn.query_row("SELECT id FROM tags WHERE tag = ?", [tag], |r|r.get(0)).unwrap();
+            stmt.execute(params![tag_id, name.to_string_lossy()]).unwrap();
+        }
+        reply.ok();
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
@@ -483,7 +501,8 @@ impl fuser::Filesystem for TagsFs {
     ) {
         trace!("read {ino}");
         match Entry::fetch(&self.conn, ino) {
-            Ok(Entry::File(path)) => {
+            Ok(Entry::File(name)) => {
+                let path = self.find_file(name);
                 let mut data = vec![0; size as usize];
                 let mut file = fs::File::open(path).unwrap();
                 file.seek(SeekFrom::Start(offset as u64)).unwrap();
@@ -599,11 +618,11 @@ impl fuser::Filesystem for TagsFs {
             }
             let file = file.unwrap();
             let path = file.path().canonicalize().unwrap();
-            let file_tags = self.tags(file.file_name().to_string_lossy());
+            let file_tags = self.file_tags(file.file_name().to_string_lossy());
             if !tags.is_subset(&file_tags) {
                 continue;
             }
-            let entry = Entry::File(path);
+            let entry = Entry::from(path.as_ref());
             let f_ino = if let Ok(ino) = entry.inode(&self.conn) {
                 ino
             } else {
@@ -616,27 +635,11 @@ impl fuser::Filesystem for TagsFs {
                 }
             }
         }
-        let mut stmt = self
-            .conn
-            .prepare_cached(
-                format!(
-                    "SELECT DISTINCT tag FROM tags WHERE tag NOT IN ({})",
-                    vec!["?"; tags.len()].join(", ")
-                )
-                .as_str(),
-            )
-            .unwrap();
-        for row in stmt
-            .query_map(rusqlite::params_from_iter(tags.into_iter()), |row| {
-                row.get(0)
-            })
-            .unwrap()
-        {
+        for row in self.sub_tags(&tags) {
             cur += 1;
             if cur <= offset {
                 continue;
             }
-            let row: String = row.unwrap();
             let entry = Entry::Tags(BTreeSet::from([row.clone()]));
             let ino = if let Ok(ino) = entry.inode(&self.conn) {
                 ino
@@ -790,7 +793,8 @@ impl fuser::Filesystem for TagsFs {
             reply.error(err);
             return;
         }
-        let ino = Entry::File(source_path.clone()).inode_or_create(&self.conn);
+        let ino = Entry::from(source_path.as_ref())
+            .inode_or_create(&self.conn);
         let attr = file_attr_of_file(ino, &source_path);
         trace!("{ino} {attr:?}");
         let tags = match Entry::fetch(&self.conn, parent) {
@@ -800,11 +804,12 @@ impl fuser::Filesystem for TagsFs {
         trace!("{tags:?}");
         let mut stmt = self
             .conn
-            .prepare_cached("INSERT INTO tags (file, tag) VALUES (?, ?)")
+            .prepare_cached("INSERT INTO file_tags (file, tag_id) VALUES (?, ?)")
             .unwrap();
         for tag in tags {
             trace!("add tag {tag:?} to {name:?}");
-            stmt.insert(params![name.to_string_lossy(), tag]).unwrap();
+            let tag_id: u64 = self.conn.query_row("SELECT id FROM tags WHERE tag = ?", [tag], |r|r.get(0)).unwrap();
+            stmt.insert(params![name.to_string_lossy(), tag_id]).unwrap();
         }
 
         reply.created(&Duration::from_secs(0), &attr, 0, 0, 0);
