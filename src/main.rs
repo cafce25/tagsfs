@@ -362,7 +362,7 @@ impl fuser::Filesystem for TagsFs {
         reply: ReplyEntry,
     ) {
         debug!(
-            "[Not Implemented] mknod(parent: {:#x?}, name: {:?}, mode: {}, \
+            "[Not Implemented] mknod(parent: {:#x?}, name: {:?}, mode: {:o}, \
             umask: {:#x?}, rdev: {})",
             parent, name, mode, umask, rdev
         );
@@ -379,7 +379,7 @@ impl fuser::Filesystem for TagsFs {
         reply: ReplyEntry,
     ) {
         debug!(
-            "[Not Implemented] mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
+            "[Not Implemented] mkdir(parent: {:#x?}, name: {:?}, mode: {:o}, umask: {:#x?})",
             parent, name, mode, umask
         );
         reply.error(ENOSYS);
@@ -465,6 +465,7 @@ impl fuser::Filesystem for TagsFs {
         lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
+        trace!("read {ino}");
         match Entry::fetch(&self.conn, ino) {
             Ok(Entry::File(path)) => {
                 let mut data = vec![0; size as usize];
@@ -548,7 +549,8 @@ impl fuser::Filesystem for TagsFs {
         reply.error(ENOSYS);
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+        trace!("opendir {ino}");
         reply.opened(0, 0);
     }
 
@@ -614,7 +616,6 @@ impl fuser::Filesystem for TagsFs {
             })
             .unwrap()
         {
-            trace!("readdir - for row in stmt - {row:?}");
             cur += 1;
             if cur <= offset {
                 continue;
@@ -850,7 +851,7 @@ impl fuser::Filesystem for TagsFs {
     ) {
         debug!(
             "[Not Implemented] fallocate(ino: {:#x?}, fh: {}, offset: {}, \
-            length: {}, mode: {})",
+            length: {}, mode: {:o})",
             ino, fh, offset, length, mode
         );
         reply.error(ENOSYS);
