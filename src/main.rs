@@ -397,11 +397,24 @@ impl fuser::Filesystem for TagsFs {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        debug!(
-            "[Not Implemented] mkdir(parent: {:#x?}, name: {:?}, mode: {:o}, umask: {:#x?})",
-            parent, name, mode, umask
+        trace!(
+            "mkdir(parent: {:#x?}, name: {:?}, mode: {:o}, umask: {:#x?})",
+            parent,
+            name,
+            mode,
+            umask
         );
-        reply.error(ENOSYS);
+        let ino = self
+            .conn
+            .prepare_cached("INSERT INTO tags (tag) VALUES (?)")
+            .unwrap()
+            .insert([name.to_string_lossy()])
+            .unwrap() as u64;
+        reply.entry(
+            &Duration::from_secs(0),
+            &file_attr_of_file(ino, self.source().unwrap()),
+            0,
+        );
     }
 
     /// Delete all tags of `parent` from the file `name`
@@ -421,8 +434,12 @@ impl fuser::Filesystem for TagsFs {
             .prepare_cached("DELETE FROM file_tags WHERE tag_id = ? AND file = ?")
             .unwrap();
         for tag in tags {
-            let tag_id: u64 = self.conn.query_row("SELECT id FROM tags WHERE tag = ?", [tag], |r|r.get(0)).unwrap();
-            stmt.execute(params![tag_id, name.to_string_lossy()]).unwrap();
+            let tag_id: u64 = self
+                .conn
+                .query_row("SELECT id FROM tags WHERE tag = ?", [tag], |r| r.get(0))
+                .unwrap();
+            stmt.execute(params![tag_id, name.to_string_lossy()])
+                .unwrap();
         }
         reply.ok();
     }
@@ -793,8 +810,7 @@ impl fuser::Filesystem for TagsFs {
             reply.error(err);
             return;
         }
-        let ino = Entry::from(source_path.as_ref())
-            .inode_or_create(&self.conn);
+        let ino = Entry::from(source_path.as_ref()).inode_or_create(&self.conn);
         let attr = file_attr_of_file(ino, &source_path);
         trace!("{ino} {attr:?}");
         let tags = match Entry::fetch(&self.conn, parent) {
@@ -808,8 +824,12 @@ impl fuser::Filesystem for TagsFs {
             .unwrap();
         for tag in tags {
             trace!("add tag {tag:?} to {name:?}");
-            let tag_id: u64 = self.conn.query_row("SELECT id FROM tags WHERE tag = ?", [tag], |r|r.get(0)).unwrap();
-            stmt.insert(params![name.to_string_lossy(), tag_id]).unwrap();
+            let tag_id: u64 = self
+                .conn
+                .query_row("SELECT id FROM tags WHERE tag = ?", [tag], |r| r.get(0))
+                .unwrap();
+            stmt.insert(params![name.to_string_lossy(), tag_id])
+                .unwrap();
         }
 
         reply.created(&Duration::from_secs(0), &attr, 0, 0, 0);
