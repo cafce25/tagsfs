@@ -445,11 +445,26 @@ impl fuser::Filesystem for TagsFs {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        debug!(
-            "[Not Implemented] rmdir(parent: {:#x?}, name: {:?})",
-            parent, name,
-        );
-        reply.error(ENOSYS);
+        trace!("rmdir(parent: {:#x?}, name: {:?})", parent, name);
+        let tag_id: u64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM tags WHERE tag = ?",
+                [name.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        self.conn
+            .prepare_cached("DELETE FROM tags WHERE id = ?")
+            .unwrap()
+            .execute([tag_id])
+            .unwrap();
+        self.conn
+            .prepare_cached("DELETE FROM file_tags WHERE tag_id = ?")
+            .unwrap()
+            .execute([tag_id])
+            .unwrap();
+        reply.ok();
     }
 
     fn symlink(
