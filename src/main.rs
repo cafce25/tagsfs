@@ -4,7 +4,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
-    ffi::{CString, OsStr, OsString},
+    ffi::{CStr, CString, OsStr, OsString},
     fs::{self, FileType},
     hash::Hash,
     io::{Read, Seek, SeekFrom},
@@ -277,8 +277,19 @@ impl fuser::Filesystem for TagsFs {
             path
         } else {
             reply.error(EINVAL);
+            trace!("setattr - EINVAL");
             return;
         };
+        let path = if path.is_absolute() {
+            path
+        } else {
+            self.source()
+                .unwrap()
+                .join(path.file_name().unwrap())
+                .canonicalize()
+                .unwrap()
+        };
+        eprintln!("{path:?}");
         let c_path = unsafe {
             CString::from_vec_unchecked(AsRef::<OsStr>::as_ref(&path).as_bytes().to_vec())
         };
@@ -324,16 +335,21 @@ impl fuser::Filesystem for TagsFs {
         if atime != attr.atime || mtime != attr.mtime {
             let atime = atime.duration_since(SystemTime::UNIX_EPOCH).unwrap();
             let mtime = mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap();
-            let times = [libc::timespec{
-                tv_sec: atime.as_secs() as i64,
-                tv_nsec: atime.subsec_nanos() as i64,
-            }, libc::timespec{
-                tv_sec: mtime.as_secs() as i64,
-                tv_nsec: mtime.subsec_nanos() as i64,
-            }];
+            let times = [
+                libc::timespec {
+                    tv_sec: atime.as_secs() as i64,
+                    tv_nsec: atime.subsec_nanos() as i64,
+                },
+                libc::timespec {
+                    tv_sec: mtime.as_secs() as i64,
+                    tv_nsec: mtime.subsec_nanos() as i64,
+                },
+            ];
 
-            let err = unsafe {libc::utimensat(0, c_path.as_ptr(), times.as_ptr(), 0)};
+            let err = unsafe { libc::utimensat(0, c_path.as_ptr(), times.as_ptr(), 0) };
             if err != 0 {
+                let error = unsafe { CStr::from_ptr(libc::strerror(*libc::__errno_location())) };
+                debug!("error in utimensat: {error:?}");
                 reply.error(err);
                 return;
             }
@@ -761,7 +777,8 @@ impl fuser::Filesystem for TagsFs {
             return;
         }
 
-        let c_path = unsafe { CString::from_vec_unchecked(source_path.as_os_str().as_bytes().to_vec()) };
+        let c_path =
+            unsafe { CString::from_vec_unchecked(source_path.as_os_str().as_bytes().to_vec()) };
         let new_fd = unsafe { libc::creat(c_path.as_ptr(), mode & !umask) };
         if new_fd == 0 {
             reply.error(EPERM);
@@ -781,14 +798,17 @@ impl fuser::Filesystem for TagsFs {
             _ => BTreeSet::new(),
         };
         trace!("{tags:?}");
-        let mut stmt = self.conn.prepare_cached("INSERT INTO tags (file, tag) VALUES (?, ?)").unwrap();
+        let mut stmt = self
+            .conn
+            .prepare_cached("INSERT INTO tags (file, tag) VALUES (?, ?)")
+            .unwrap();
         for tag in tags {
             trace!("add tag {tag:?} to {name:?}");
             stmt.insert(params![name.to_string_lossy(), tag]).unwrap();
         }
 
-
         reply.created(&Duration::from_secs(0), &attr, 0, 0, 0);
+        trace!("finished create");
     }
 
     fn getlk(
