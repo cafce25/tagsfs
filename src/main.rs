@@ -4,19 +4,19 @@
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
-    ffi::{OsStr, OsString},
+    ffi::{CString, OsStr, OsString},
     fs::{self, FileType},
     hash::Hash,
     io::{Read, Seek, SeekFrom},
     mem,
-    os::unix::prelude::{MetadataExt, PermissionsExt},
+    os::unix::prelude::{MetadataExt, OsStrExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 use anyhow::anyhow;
 use clap::Parser;
-use fuser::{FileAttr, MountOption, ReplyEntry, Request};
+use fuser::{FileAttr, MountOption, ReplyEntry, Request, TimeOrNow};
 use itertools::Itertools as _;
 use libc::{c_int, EINVAL, ENODATA, ENOENT, ENOSYS, EPERM};
 use log::{debug, info, trace, warn};
@@ -165,19 +165,6 @@ impl TagsFs {
             .ok()
             .map(PathBuf::from)
     }
-
-    // fn directories(&self) -> anyhow::Result<Vec<String>> {
-    //     let mut stmt = self
-    //         .conn
-    //         .prepare_cached("SELECT value FROM options WHERE key = 'directory'")?;
-    //     let mut rows = stmt.query_map([], |row| row.get(0))?;
-    //     Ok(
-    //         rows.try_fold(vec![], |mut v, r| -> Result<_, rusqlite::Error> {
-    //             v.push(r?);
-    //             Ok(v)
-    //         })?,
-    //     )
-    // }
 }
 
 impl fuser::Filesystem for TagsFs {
@@ -242,6 +229,7 @@ impl fuser::Filesystem for TagsFs {
                 return;
             }
         }
+        reply.error(ENOENT);
     }
 
     fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {
@@ -272,9 +260,9 @@ impl fuser::Filesystem for TagsFs {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<SystemTime>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        ctime: Option<SystemTime>,
         fh: Option<u64>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
@@ -282,12 +270,80 @@ impl fuser::Filesystem for TagsFs {
         flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
-        debug!(
-            "[Not Implemented] setattr(ino: {:#x?}, mode: {:?}, uid: {:?}, \
-            gid: {:?}, size: {:?}, fh: {:?}, flags: {:?})",
-            ino, mode, uid, gid, size, fh, flags
-        );
-        reply.error(ENOSYS);
+        trace!("setattr");
+        // currently only allow setting attributes of files since all tags show the attributes of
+        // the source directory
+        let path = if let Ok(Entry::File(path)) = Entry::fetch(&self.conn, ino) {
+            path
+        } else {
+            reply.error(EINVAL);
+            return;
+        };
+        let c_path = unsafe {
+            CString::from_vec_unchecked(AsRef::<OsStr>::as_ref(&path).as_bytes().to_vec())
+        };
+        let mut attr = file_attr_of_file(ino, &path);
+
+        if let Some(mode) = mode {
+            let perm = PermissionsExt::from_mode(mode);
+            fs::set_permissions(path, perm).unwrap();
+        }
+
+        let uid = uid.unwrap_or(attr.uid);
+        let gid = gid.unwrap_or(attr.gid);
+        if uid != attr.uid || gid != attr.gid {
+            let err = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+            if err != 0 {
+                reply.error(err);
+                return;
+            }
+            attr.gid = gid;
+            attr.uid = uid;
+        }
+
+        if let Some(size) = size {
+            if size != attr.size {
+                let err = unsafe { libc::truncate(c_path.as_ptr(), size as i64) };
+                if err != 0 {
+                    reply.error(err);
+                    return;
+                }
+                attr.size = size;
+            }
+        }
+        let atime = match atime {
+            Some(TimeOrNow::SpecificTime(atime)) => atime,
+            Some(TimeOrNow::Now) => SystemTime::now(),
+            None => attr.atime,
+        };
+        let mtime = match mtime {
+            Some(TimeOrNow::SpecificTime(mtime)) => mtime,
+            Some(TimeOrNow::Now) => SystemTime::now(),
+            None => attr.mtime,
+        };
+        if atime != attr.atime || mtime != attr.mtime {
+            let atime = atime.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+            let mtime = mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+            let times = [libc::timespec{
+                tv_sec: atime.as_secs() as i64,
+                tv_nsec: atime.subsec_nanos() as i64,
+            }, libc::timespec{
+                tv_sec: mtime.as_secs() as i64,
+                tv_nsec: mtime.subsec_nanos() as i64,
+            }];
+
+            let err = unsafe {libc::utimensat(0, c_path.as_ptr(), times.as_ptr(), 0)};
+            if err != 0 {
+                reply.error(err);
+                return;
+            }
+        }
+        // ctime: Option<SystemTime>, can't change it other than setting to now
+        // crtime: Option<SystemTime>, macos only we don't care
+        // chgtime: Option<SystemTime>, ?!?
+        // bkuptime: Option<SystemTime>, ?!?
+        // flags: Option<u32>,
+        reply.attr(&Duration::from_secs(0), &attr);
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyData) {
