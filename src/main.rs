@@ -482,6 +482,8 @@ impl fuser::Filesystem for TagsFs {
         reply.error(EPERM);
     }
 
+    /// change set of tags, it will ignore the newname since that would require a change on the
+    /// underlying file system
     fn rename(
         &mut self,
         _req: &Request<'_>,
@@ -492,12 +494,58 @@ impl fuser::Filesystem for TagsFs {
         flags: u32,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!(
-            "[Not Implemented] rename(parent: {:#x?}, name: {:?}, newparent: {:#x?}, \
+        trace!(
+            "rename(parent: {:#x?}, name: {:?}, newparent: {:#x?}, \
             newname: {:?}, flags: {})",
-            parent, name, newparent, newname, flags,
+            parent,
+            name,
+            newparent,
+            newname,
+            flags,
         );
-        reply.error(ENOSYS);
+        let tags = match Entry::fetch(&self.conn, parent) {
+            Ok(Entry::Tags(tags)) => tags,
+            _ => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        let newtags = match Entry::fetch(&self.conn, newparent) {
+            Ok(Entry::Tags(tags)) => tags,
+            _ => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+
+        for removed_tag in tags.iter().filter(|t| !newtags.contains(*t)) {
+            let tag_id: u64 = self
+                .conn
+                .prepare_cached("SELECT id FROM tags WHERE tag = ?")
+                .unwrap()
+                .query_row([removed_tag], |r| r.get(0))
+                .unwrap();
+            self.conn
+                .prepare_cached("DELETE FROM file_tags WHERE tag_id = ?")
+                .unwrap()
+                .execute([tag_id])
+                .unwrap();
+        }
+
+        for added_tag in newtags.iter().filter(|t| !tags.contains(*t)) {
+            let tag_id: u64 = self
+                .conn
+                .prepare_cached("SELECT id FROM tags WHERE tag = ?")
+                .unwrap()
+                .query_row([added_tag], |r| r.get(0))
+                .unwrap();
+            self.conn
+                .prepare_cached("INSERT INTO file_tags (file, tag_id) VALUES (?, ?)")
+                .unwrap()
+                .insert(params![name.to_string_lossy(), tag_id])
+                .unwrap();
+        }
+        reply.ok();
     }
 
     fn link(
