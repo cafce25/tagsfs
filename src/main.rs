@@ -5,7 +5,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
     ffi::{CStr, CString, OsStr, OsString},
-    fs::{self, FileType, File},
+    fs::{self, File, FileType},
     hash::Hash,
     io::{Read, Seek, SeekFrom, Write},
     mem,
@@ -189,7 +189,7 @@ impl TagsFs {
             .map(PathBuf::from)
     }
 
-    fn find_file(&self, name: OsString) -> PathBuf {
+    fn find_file<S: AsRef<Path>>(&self, name: S) -> PathBuf {
         self.source().unwrap().join(name).canonicalize().unwrap()
     }
 }
@@ -433,13 +433,17 @@ impl fuser::Filesystem for TagsFs {
             .conn
             .prepare_cached("DELETE FROM file_tags WHERE tag_id = ? AND file = ?")
             .unwrap();
-        for tag in tags {
-            let tag_id: u64 = self
-                .conn
-                .query_row("SELECT id FROM tags WHERE tag = ?", [tag], |r| r.get(0))
-                .unwrap();
-            stmt.execute(params![tag_id, name.to_string_lossy()])
-                .unwrap();
+        if tags.is_empty() {
+            fs::remove_file(self.find_file(name)).unwrap();
+        } else {
+            for tag in tags {
+                let tag_id: u64 = self
+                    .conn
+                    .query_row("SELECT id FROM tags WHERE tag = ?", [tag], |r| r.get(0))
+                    .unwrap();
+                stmt.execute(params![tag_id, name.to_string_lossy()])
+                    .unwrap();
+            }
         }
         reply.ok();
     }
@@ -548,6 +552,7 @@ impl fuser::Filesystem for TagsFs {
         reply.ok();
     }
 
+    /// all links have the same file name since they share the name of the backing file
     fn link(
         &mut self,
         _req: &Request<'_>,
@@ -556,11 +561,39 @@ impl fuser::Filesystem for TagsFs {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        debug!(
-            "[Not Implemented] link(ino: {:#x?}, newparent: {:#x?}, newname: {:?})",
-            ino, newparent, newname
+        trace!(
+            "link(ino: {:#x?}, newparent: {:#x?}, newname: {:?})",
+            ino,
+            newparent,
+            newname
         );
-        reply.error(EPERM);
+        let name = match Entry::fetch(&self.conn, ino) {
+            Ok(Entry::File(name)) => name,
+            _ => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        let tags = match Entry::fetch(&self.conn, newparent) {
+            Ok(Entry::Tags(tags)) => tags,
+            _ => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        for tag in tags {
+            let tag_id: u64 = self
+                .conn
+                .prepare_cached("SELECT id FROM tags WHERE tag = ?")
+                .unwrap()
+                .query_row([tag], |r| r.get(0))
+                .unwrap();
+            self.conn
+                .prepare_cached("SELECT OR INSERT INTO file_tags (file, tag_id) VALUES (?, ?)")
+                .unwrap()
+                .insert(params![name.to_string_lossy(), tag_id])
+                .unwrap();
+        }
     }
 
     fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
