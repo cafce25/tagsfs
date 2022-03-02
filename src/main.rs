@@ -5,9 +5,9 @@ use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
     ffi::{CStr, CString, OsStr, OsString},
-    fs::{self, FileType},
+    fs::{self, FileType, File},
     hash::Hash,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     mem,
     os::unix::prelude::{MetadataExt, OsStrExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -606,18 +606,24 @@ impl fuser::Filesystem for TagsFs {
         lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        debug!(
-            "[Not Implemented] write(ino: {:#x?}, fh: {}, offset: {}, data.len(): {}, \
-            write_flags: {:#x?}, flags: {:#x?}, lock_owner: {:?})",
-            ino,
-            fh,
-            offset,
+        trace!(
+            "write(ino: {ino:#x?}, fh: {fh}, offset: {offset}, data.len(): {}, \
+            write_flags: {write_flags:#x?}, flags: {flags:#x?}, lock_owner: {lock_owner:?})",
             data.len(),
-            write_flags,
-            flags,
-            lock_owner
         );
-        reply.error(ENOSYS);
+        let path = match Entry::fetch(&self.conn, ino) {
+            Ok(Entry::File(name)) => self.source().unwrap().join(name).canonicalize().unwrap(),
+            _ => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        let mut file = File::options().write(true).append(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        match file.write(data) {
+            Ok(size) => reply.written(size as u32),
+            Err(_) => reply.error(EINVAL),
+        }
     }
 
     fn flush(
